@@ -1,0 +1,2998 @@
+--[[
+    Emote Hub - standalone GUI version (v2)
+    ---------------------------------------
+    Tabs
+      Emotes     - scrolling thumbnail grid, click to play
+      Favorites  - everything you starred
+      Anim Packs - animation packs; click one to apply it, click it again to reset.
+                   Chips at the bottom (All / Idle / Walk / Run / Jump / Fall) choose
+                   whether a click applies the whole pack or just that part
+      Binds      - keybinds you saved for emotes / packs
+
+    How to make a keybind
+      Press the small BIND button on any card (or right-click the card),
+      then press the key you want. Esc cancels. Press the key in-game to run it.
+      Pressing a bound emote's key again while it plays stops it.
+      Reserved keys: W A S D Space Tab /
+
+    Performance
+      * Cards are pooled and reused as you scroll
+      * The grid is virtualised: only the rows on screen exist, however long the list
+      * Scrolling and resizing only touch the few cards on screen
+      * Pack data is cached to disk after the first time you use a pack
+
+    Emote / animation lists come from the same JSON sources as the original script.
+    Emotes use Humanoid:PlayEmoteAndGetAnimTrackById, so they need an R15 character.
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local UIX = {} -- holds many helpers/widgets (Luau allows only 200 locals per chunk)
+
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+-- Re-executing unloads the previous copy first: it resets animations, walk speed,
+-- noclip, antifling and head movement to normal, stops emotes, and removes the old GUI.
+if type(env.EmoteHubCleanup) == "function" then
+    pcall(env.EmoteHubCleanup)
+    env.EmoteHubCleanup = nil
+end
+if env.EmoteHubGui then
+    pcall(function() env.EmoteHubGui:Destroy() end)
+    env.EmoteHubGui = nil
+end
+-- sweep for any leftover window from an older copy that can't clean itself up
+pcall(function() RunService:UnbindFromRenderStep("EmoteHubStillHead") end)
+for _, getRoot in ipairs({
+    function() return typeof(gethui) == "function" and gethui() or nil end,
+    function() return game:GetService("CoreGui") end,
+    function() return LocalPlayer:FindFirstChildOfClass("PlayerGui") end,
+}) do
+    pcall(function()
+        local root = getRoot()
+        local old = root and root:FindFirstChild("EmoteHubGUI")
+        while old do
+            old:Destroy()
+            old = root:FindFirstChild("EmoteHubGUI")
+        end
+    end)
+end
+
+------------------------------------------------------------------------
+-- Config
+------------------------------------------------------------------------
+UIX.EMOTE_URL = "https://raw.githubusercontent.com/7yd7/sniper-Emote/refs/heads/test/EmoteSniper.json"
+UIX.PACK_URLS = {
+    "https://raw.githubusercontent.com/7yd7/sniper-Emote/refs/heads/test/AnimationSniper.json",
+    "https://raw.githubusercontent.com/7yd7/sniper-Emote/refs/heads/test/AnimationSniperoffsale.json",
+}
+
+local SAVE_DIR = "EmoteHub"
+UIX.FAV_FILE = SAVE_DIR .. "/Favorites.json"
+UIX.SETTINGS_FILE = SAVE_DIR .. "/Settings.json"
+UIX.BINDS_FILE = SAVE_DIR .. "/Binds.json"
+UIX.PACKCACHE_FILE = SAVE_DIR .. "/PackCache.json"
+UIX.EMOTELIST_FILE = SAVE_DIR .. "/EmoteList.json" -- saved copy of every emote
+UIX.PACKLIST_FILE = SAVE_DIR .. "/PackList.json"   -- saved copy of every anim pack
+
+UIX.SPEED_MIN, UIX.SPEED_MAX, UIX.SPEED_BOX_MAX = 0.1, 5, 10
+UIX.MIN_W, UIX.MIN_H = 330, 340
+UIX.MAX_W, UIX.MAX_H = 900, 800
+local CELL_W, CELL_H, PAD = 96, 144, 6
+local TITLE_H = 34
+UIX.CHUNK = 6 -- cards built per frame
+
+local TAB_ORDER = { "Emotes", "Packs", "Favorites", "Binds", "Settings" }
+UIX.TAB_LABELS = { Emotes = "Emotes", Packs = "Anim Packs", Favorites = "Favs", Binds = "Binds", Settings = "Settings" }
+
+local PACK_CATS = {
+    { label = "All" },
+    { label = "Idle", key = "idle" },
+    { label = "Walk", key = "walk" },
+    { label = "Run", key = "run" },
+    { label = "Jump", key = "jump" },
+    { label = "Fall", key = "fall" },
+}
+
+local RESERVED_KEYS = { W = true, A = true, S = true, D = true, Space = true, Tab = true, Slash = true }
+UIX.KEY_LABELS = {
+    One = "1", Two = "2", Three = "3", Four = "4", Five = "5",
+    Six = "6", Seven = "7", Eight = "8", Nine = "9", Zero = "0",
+}
+
+local C = {
+    bg = Color3.fromRGB(24, 26, 30),
+    panel = Color3.fromRGB(36, 39, 45),
+    panelHi = Color3.fromRGB(48, 52, 60),
+    accent = Color3.fromRGB(0, 255, 150),
+    text = Color3.fromRGB(235, 235, 235),
+    dim = Color3.fromRGB(150, 150, 155),
+    dark = Color3.fromRGB(20, 22, 25),
+    gold = Color3.fromRGB(255, 210, 60),
+    red = Color3.fromRGB(220, 70, 70),
+}
+
+------------------------------------------------------------------------
+-- File + HTTP helpers (all optional / guarded)
+------------------------------------------------------------------------
+function UIX.canFile()
+    return typeof(writefile) == "function" and typeof(readfile) == "function" and typeof(isfile) == "function"
+end
+
+local function readJson(path)
+    if not UIX.canFile() then return nil end
+    local okExists, exists = pcall(isfile, path)
+    if not okExists or not exists then return nil end
+    local ok, data = pcall(function()
+        return HttpService:JSONDecode(readfile(path))
+    end)
+    if ok and type(data) == "table" then return data end
+    return nil
+end
+
+local function writeJson(path, data)
+    if not UIX.canFile() then return end
+    pcall(function()
+        if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(SAVE_DIR) then
+            makefolder(SAVE_DIR)
+        end
+        writefile(path, HttpService:JSONEncode(data))
+    end)
+end
+
+function UIX.httpGet(url)
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok and type(body) == "string" and body ~= "" then return body end
+
+    local req = (typeof(request) == "function" and request)
+        or (typeof(http_request) == "function" and http_request)
+        or (syn and syn.request)
+    if req then
+        local ok2, res = pcall(req, { Url = url, Method = "GET" })
+        if ok2 and res and res.Body and res.Body ~= "" then return res.Body end
+    end
+    return nil
+end
+
+function UIX.fetchList(url)
+    local body = UIX.httpGet(url)
+    if not body then return nil end
+    local ok, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+    if ok and type(decoded) == "table" then
+        return decoded.data or decoded
+    end
+    return nil
+end
+
+------------------------------------------------------------------------
+-- State
+------------------------------------------------------------------------
+local saved = readJson(UIX.SETTINGS_FILE) or {}
+
+local state = {
+    tab = "Emotes",
+    search = "",
+    speed = math.clamp(tonumber(saved.speed) or 1, UIX.SPEED_MIN, UIX.SPEED_BOX_MAX),
+    autoLoad = true, -- always on
+    bindsEnabled = saved.bindsEnabled ~= false,
+    walkStop = saved.walkStop == true,
+    noclip = false, -- effects always start off, so every run is a clean slate
+    noclipKey = (type(saved.noclipKey) == "string" and saved.noclipKey ~= "") and saved.noclipKey or nil,
+    antifling = false,
+    noHead = false,
+    cfValue = math.clamp(tonumber(saved.cfValue) or 50, 0, 500),
+    cframeSpeedOn = saved.cframeSpeedOn == true,
+    posX = tonumber(saved.posX),
+    posY = tonumber(saved.posY),
+    emotes = {},
+    packs = {},
+    favorites = {},
+    favSet = {},
+    binds = {},
+    loadingEmotes = true,
+    loadingPacks = true,
+    track = nil,
+    activeEmote = nil,
+    activePack = nil,
+    activeParts = {},
+    filterCache = nil,
+    packCategory = (type(saved.packCategory) == "string") and saved.packCategory or nil, -- nil = full pack, otherwise "idle" / "walk" / ...
+    view = {},
+    shown = 0,
+}
+
+local sizeNow = Vector2.new(
+    math.clamp(tonumber(saved.width) or 440, UIX.MIN_W, UIX.MAX_W),
+    math.clamp(tonumber(saved.height) or 500, UIX.MIN_H, UIX.MAX_H)
+)
+
+local function favKey(kind, id)
+    return kind .. ":" .. tostring(id)
+end
+
+function UIX.capitalize(s)
+    return (s:sub(1, 1):upper() .. s:sub(2))
+end
+
+local function keyLabel(name)
+    return UIX.KEY_LABELS[name] or name
+end
+
+local function decorate(item)
+    item.lname = tostring(item.name or ""):lower()
+    item.sid = tostring(item.id)
+    return item
+end
+
+do -- favorites (migrates old "state" entries to "pack")
+    local loaded = readJson(UIX.FAV_FILE)
+    if loaded then
+        for _, fav in ipairs(loaded) do
+            if type(fav) == "table" and fav.id then
+                local kind = fav.kind == "state" and "pack" or fav.kind
+                if kind == "emote" or kind == "pack" then
+                    table.insert(state.favorites, decorate({
+                        kind = kind,
+                        id = tonumber(fav.id) or fav.id,
+                        name = tostring(fav.name or ("Item_" .. tostring(fav.id))),
+                        bundledItems = fav.bundledItems,
+                    }))
+                    state.favSet[favKey(kind, fav.id)] = true
+                end
+            end
+        end
+    end
+end
+
+local bindsByKey = {}
+local function rebuildBindIndex()
+    bindsByKey = {}
+    for _, b in ipairs(state.binds) do
+        bindsByKey[b.key] = b
+    end
+end
+
+do -- binds
+    local loaded = readJson(UIX.BINDS_FILE)
+    if loaded then
+        for _, b in ipairs(loaded) do
+            if type(b) == "table" and type(b.key) == "string" and b.id and (b.kind == "emote" or b.kind == "pack") then
+                table.insert(state.binds, decorate({
+                    key = b.key,
+                    kind = b.kind,
+                    id = tonumber(b.id) or b.id,
+                    name = tostring(b.name or ("Item_" .. tostring(b.id))),
+                    bundledItems = b.bundledItems,
+                    category = type(b.category) == "string" and b.category or nil,
+                }))
+            end
+        end
+    end
+    rebuildBindIndex()
+end
+
+local function saveFavorites()
+    local out = {}
+    for _, f in ipairs(state.favorites) do
+        table.insert(out, { kind = f.kind, id = f.id, name = f.name, bundledItems = f.bundledItems })
+    end
+    writeJson(UIX.FAV_FILE, out)
+end
+
+local function saveBinds()
+    local out = {}
+    for _, b in ipairs(state.binds) do
+        table.insert(out, {
+            key = b.key, kind = b.kind, id = b.id, name = b.name,
+            bundledItems = b.bundledItems, category = b.category,
+        })
+    end
+    writeJson(UIX.BINDS_FILE, out)
+end
+
+local function saveSettings()
+    writeJson(UIX.SETTINGS_FILE, {
+        speed = state.speed,
+        width = sizeNow.X,
+        height = sizeNow.Y,
+        bindsEnabled = state.bindsEnabled,
+        tab = state.tab,
+        walkStop = state.walkStop,
+        noclip = state.noclip,
+        noclipKey = state.noclipKey or "",
+        antifling = state.antifling,
+        noHead = state.noHead,
+        cfValue = state.cfValue,
+        cframeSpeedOn = state.cframeSpeedOn,
+        packCategory = state.packCategory,
+        posX = state.posX,
+        posY = state.posY,
+    })
+end
+
+local function toggleFavorite(item)
+    state.filterCache = nil -- favorites list is about to change
+    local key = favKey(item.kind, item.id)
+    if state.favSet[key] then
+        state.favSet[key] = nil
+        for i, fav in ipairs(state.favorites) do
+            if favKey(fav.kind, fav.id) == key then
+                table.remove(state.favorites, i)
+                break
+            end
+        end
+        saveFavorites()
+        return false
+    end
+    state.favSet[key] = true
+    table.insert(state.favorites, decorate({
+        kind = item.kind,
+        id = item.id,
+        name = item.name,
+        bundledItems = item.bundledItems,
+    }))
+    saveFavorites()
+    return true
+end
+
+-- cached pack mappings (idle/walk/run/... animation ids per pack), saved to disk
+local mappingCache = readJson(UIX.PACKCACHE_FILE) or {}
+UIX.packCacheToken = 0
+local function savePackCacheSoon()
+    UIX.packCacheToken = UIX.packCacheToken + 1
+    local token = UIX.packCacheToken
+    task.delay(1, function()
+        if token == UIX.packCacheToken then
+            writeJson(UIX.PACKCACHE_FILE, mappingCache)
+        end
+    end)
+end
+
+------------------------------------------------------------------------
+-- UI helpers
+------------------------------------------------------------------------
+local function new(class, props, children)
+    local inst = Instance.new(class)
+    local parent
+    for k, v in pairs(props or {}) do
+        if k == "Parent" then
+            parent = v
+        else
+            inst[k] = v
+        end
+    end
+    for _, child in ipairs(children or {}) do
+        child.Parent = inst
+    end
+    if parent then inst.Parent = parent end
+    return inst
+end
+
+-- all radii are scaled up so everything has soft, rounded corners
+UIX.CORNER_SCALE = 1.9
+local function corner(r)
+    return new("UICorner", { CornerRadius = UDim.new(0, math.floor(r * UIX.CORNER_SCALE + 0.5)) })
+end
+
+function UIX.mount(screenGui)
+    local ok = pcall(function()
+        if typeof(gethui) == "function" then
+            screenGui.Parent = gethui()
+        else
+            screenGui.Parent = game:GetService("CoreGui")
+        end
+    end)
+    if not ok or not screenGui.Parent then
+        screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+end
+
+------------------------------------------------------------------------
+-- Build the window
+------------------------------------------------------------------------
+local gui = new("ScreenGui", {
+    Name = "EmoteHubGUI",
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    DisplayOrder = 100,
+    IgnoreGuiInset = true,
+})
+UIX.mount(gui)
+env.EmoteHubGui = gui
+
+local viewport = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(1280, 720)
+
+local main = new("Frame", {
+    Name = "Main",
+    Parent = gui,
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    Size = UDim2.fromOffset(sizeNow.X, sizeNow.Y),
+    Position = UDim2.fromOffset(
+        (tonumber(saved.posX) and math.clamp(saved.posX, 0, math.max(0, viewport.X - 60)))
+            or math.max(10, viewport.X - sizeNow.X - 20),
+        (tonumber(saved.posY) and math.clamp(saved.posY, 0, math.max(0, viewport.Y - 40)))
+            or math.max(10, viewport.Y / 2 - sizeNow.Y / 2)
+    ),
+}, {
+    corner(10),
+    new("UIStroke", { Color = C.accent, Transparency = 0.55, Thickness = 1.5 }),
+})
+
+-- Title bar (drag handle)
+local titleBar = new("Frame", {
+    Name = "TitleBar",
+    Parent = main,
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+    Size = UDim2.new(1, 0, 0, TITLE_H),
+}, { corner(10) })
+
+-- squares off the title bar's bottom corners so only the top ones are round
+new("Frame", {
+    Parent = titleBar,
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+    Position = UDim2.new(0, 0, 1, -14),
+    Size = UDim2.new(1, 0, 0, 14),
+})
+
+new("TextLabel", {
+    Parent = titleBar,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(12, 0),
+    Size = UDim2.new(0, 100, 1, 0),
+    Font = Enum.Font.GothamBold,
+    Text = "Emote Hub",
+    TextColor3 = C.accent,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local statusLabel = new("TextLabel", {
+    Parent = titleBar,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(112, 0),
+    Size = UDim2.new(1, -152, 1, 0),
+    Font = Enum.Font.Gotham,
+    Text = "",
+    TextColor3 = C.dim,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Right,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+})
+
+UIX.minBtn = new("TextButton", {
+    Parent = titleBar,
+    BackgroundColor3 = C.panelHi,
+    Position = UDim2.new(1, -32, 0, 5),
+    Size = UDim2.fromOffset(24, 24),
+    Font = Enum.Font.GothamBold,
+    Text = "-",
+    TextColor3 = C.text,
+    TextSize = 16,
+}, { corner(6) })
+
+-- Body (everything below the title bar; hidden when minimized)
+local body = new("Frame", {
+    Name = "Body",
+    Parent = main,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(0, TITLE_H),
+    Size = UDim2.new(1, 0, 1, -TITLE_H),
+})
+
+-- Tabs
+UIX.tabRow = new("Frame", {
+    Parent = body,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(8, 6),
+    Size = UDim2.new(1, -16, 0, 28),
+}, {
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }),
+})
+
+local tabButtons = {}
+for i, name in ipairs(TAB_ORDER) do
+    tabButtons[name] = new("TextButton", {
+        Parent = UIX.tabRow,
+        LayoutOrder = i,
+        BackgroundColor3 = C.panel,
+        Size = UDim2.new(1 / #TAB_ORDER, -4, 1, 0),
+        Font = Enum.Font.GothamBold,
+        Text = UIX.TAB_LABELS[name],
+        TextColor3 = C.text,
+        TextScaled = true,
+        AutoButtonColor = false,
+    }, {
+        corner(7),
+        new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 8 }),
+        new("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4) }),
+    })
+end
+
+-- Search (+ pack category dropdown on the Anim Packs tab)
+local searchBox = new("TextBox", {
+    Parent = body,
+    BackgroundColor3 = C.panel,
+    Position = UDim2.fromOffset(8, 40),
+    Size = UDim2.new(1, -16, 0, 28),
+    Font = Enum.Font.Gotham,
+    PlaceholderText = "Search name or ID...",
+    PlaceholderColor3 = C.dim,
+    Text = "",
+    TextColor3 = C.text,
+    TextSize = 12,
+    ClearTextOnFocus = false,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, {
+    corner(7),
+    new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }),
+})
+
+-- Anim Packs category chips (bottom of the window, only on the Anim Packs tab)
+UIX.chipRow = new("Frame", {
+    Parent = body,
+    AnchorPoint = Vector2.new(0, 1),
+    BackgroundTransparency = 1,
+    Position = UDim2.new(0, 8, 1, -42),
+    Size = UDim2.new(1, -16, 0, 34),
+    Visible = false,
+}, {
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+    }),
+})
+
+local chipButtons = {}
+for i, cat in ipairs(PACK_CATS) do
+    chipButtons[i] = new("TextButton", {
+        Parent = UIX.chipRow,
+        LayoutOrder = i,
+        BackgroundColor3 = C.panel,
+        Size = UDim2.new(1 / #PACK_CATS, -4, 1, 0),
+        Font = Enum.Font.GothamBold,
+        Text = cat.label,
+        TextColor3 = C.text,
+        TextSize = 10,
+        TextWrapped = true,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        AutoButtonColor = false,
+    }, {
+        corner(7),
+        new("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2) }),
+    })
+end
+
+local chipNames = { src = nil, map = {} }
+-- Show which pack is applied to each part (or "default") under each chip label
+local function refreshChipLabels()
+    local function nameOf(id)
+        if id == nil then return nil end
+        -- id -> name map is built only when a pack is actually applied,
+        -- and rebuilt only when the pack list itself changes
+        if chipNames.src ~= state.packs then
+            chipNames.src = state.packs
+            chipNames.map = {}
+            for _, p in ipairs(state.packs) do
+                chipNames.map[tostring(p.id)] = p.name
+            end
+        end
+        local sid = tostring(id)
+        return chipNames.map[sid] or sid
+    end
+    for i, cat in ipairs(PACK_CATS) do
+        local applied
+        if cat.key then
+            applied = nameOf(state.activeParts[cat.key]) or nameOf(state.activePack)
+        else
+            applied = nameOf(state.activePack)
+        end
+        local text = cat.label .. "\n" .. (applied or "default")
+        if chipButtons[i].Text ~= text then chipButtons[i].Text = text end
+    end
+end
+
+-- Speed row
+UIX.speedRow = new("Frame", {
+    Parent = body,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(8, 72),
+    Size = UDim2.new(1, -16, 0, 30),
+})
+
+new("TextLabel", {
+    Parent = UIX.speedRow,
+    BackgroundTransparency = 1,
+    Size = UDim2.new(0, 48, 1, 0),
+    Font = Enum.Font.GothamBold,
+    Text = "Speed",
+    TextColor3 = C.text,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+UIX.track = new("Frame", {
+    Parent = UIX.speedRow,
+    BackgroundColor3 = C.panelHi,
+    BorderSizePixel = 0,
+    Position = UDim2.new(0, 52, 0.5, -3),
+    Size = UDim2.new(1, -52 - 118, 0, 6),
+}, { corner(3) })
+
+UIX.fill = new("Frame", {
+    Parent = UIX.track,
+    BackgroundColor3 = C.accent,
+    BorderSizePixel = 0,
+    Size = UDim2.new(0, 0, 1, 0),
+}, { corner(3) })
+
+UIX.knob = new("Frame", {
+    Parent = UIX.track,
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+    Position = UDim2.new(0, 0, 0.5, 0),
+    Size = UDim2.fromOffset(14, 14),
+    ZIndex = 2,
+}, { corner(7) })
+
+UIX.sliderHit = new("TextButton", {
+    Parent = UIX.track,
+    BackgroundTransparency = 1,
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, -6, 0.5, 0),
+    Size = UDim2.new(1, 12, 0, 24),
+    Text = "",
+    ZIndex = 3,
+})
+
+UIX.speedBox = new("TextBox", {
+    Parent = UIX.speedRow,
+    AnchorPoint = Vector2.new(1, 0.5),
+    BackgroundColor3 = C.panel,
+    Position = UDim2.new(1, -62, 0.5, 0),
+    Size = UDim2.fromOffset(46, 24),
+    Font = Enum.Font.GothamBold,
+    Text = "1",
+    TextColor3 = C.text,
+    TextSize = 12,
+    ClearTextOnFocus = false,
+}, { corner(6) })
+
+UIX.speedReset = new("TextButton", {
+    Parent = UIX.speedRow,
+    AnchorPoint = Vector2.new(1, 0.5),
+    BackgroundColor3 = C.panelHi,
+    Position = UDim2.new(1, 0, 0.5, 0),
+    Size = UDim2.fromOffset(56, 24),
+    Font = Enum.Font.GothamBold,
+    Text = "Reset",
+    TextColor3 = C.accent,
+    TextSize = 12,
+}, { corner(6) })
+
+-- Scrolling item grid (Emotes / Anim Packs / Favorites)
+local listFrame = new("ScrollingFrame", {
+    Name = "List",
+    Parent = body,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Position = UDim2.fromOffset(8, 108),
+    Size = UDim2.new(1, -16, 1, -152),
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    ScrollBarThickness = 5,
+    ScrollBarImageColor3 = C.accent,
+})
+
+-- Scrolling bind list (Binds tab)
+local bindList = new("ScrollingFrame", {
+    Name = "BindList",
+    Parent = body,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Position = UDim2.fromOffset(8, 108),
+    Size = UDim2.new(1, -16, 1, -152),
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    ScrollBarThickness = 5,
+    ScrollBarImageColor3 = C.accent,
+    Visible = false,
+}, {
+    new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }),
+    new("UIPadding", { PaddingRight = UDim.new(0, 8) }),
+})
+
+local emptyLabel = new("TextLabel", {
+    Parent = body,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(8, 108),
+    Size = UDim2.new(1, -16, 1, -152),
+    Font = Enum.Font.Gotham,
+    Text = "",
+    TextColor3 = C.dim,
+    TextSize = 13,
+    TextWrapped = true,
+    Visible = false,
+})
+
+-- Settings tab
+UIX.settingsPanel = new("ScrollingFrame", {
+    Name = "SettingsPanel",
+    Parent = body,
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Position = UDim2.fromOffset(8, 108),
+    Size = UDim2.new(1, -16, 1, -152),
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    ScrollBarThickness = 5,
+    ScrollBarImageColor3 = C.accent,
+    Visible = false,
+}, {
+    new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+    new("UIPadding", { PaddingRight = UDim.new(0, 8) }),
+})
+
+function UIX.makeToggleRow(order, title, desc, reserve)
+    reserve = reserve or 0
+    local row = new("Frame", {
+        Parent = UIX.settingsPanel,
+        LayoutOrder = order,
+        BackgroundColor3 = C.panel,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 64),
+    }, { corner(8) })
+
+    new("TextLabel", {
+        Parent = row,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(12, 8),
+        Size = UDim2.new(1, -92 - reserve, 0, 18),
+        Font = Enum.Font.GothamBold,
+        Text = title,
+        TextColor3 = C.text,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    })
+
+    new("TextLabel", {
+        Parent = row,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(12, 28),
+        Size = UDim2.new(1, -92 - reserve, 0, 30),
+        Font = Enum.Font.Gotham,
+        Text = desc,
+        TextColor3 = C.dim,
+        TextSize = 11,
+        TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+    })
+
+    return new("TextButton", {
+        Parent = row,
+        AnchorPoint = Vector2.new(1, 0.5),
+        BackgroundColor3 = C.panelHi,
+        Position = UDim2.new(1, -10, 0.5, 0),
+        Size = UDim2.fromOffset(60, 30),
+        Font = Enum.Font.GothamBold,
+        Text = "OFF",
+        TextColor3 = C.dim,
+        TextSize = 13,
+    }, { corner(8) })
+end
+
+UIX.walkStopBtn = UIX.makeToggleRow(
+    1,
+    "Walk stop",
+    "ON: walking cancels the emote you're playing.\nOFF: the emote keeps playing while you walk."
+)
+
+UIX.noclipBtn = UIX.makeToggleRow(
+    2,
+    "Noclip",
+    "Walk through walls.\nPick a key to toggle it.",
+    84
+)
+
+-- the noclip key button sits on the Noclip row, left of its ON/OFF button
+UIX.noclipKeyBtn = new("TextButton", {
+    Parent = UIX.noclipBtn.Parent,
+    AnchorPoint = Vector2.new(1, 0.5),
+    BackgroundColor3 = C.panelHi,
+    Position = UDim2.new(1, -76, 0.5, 0),
+    Size = UDim2.fromOffset(74, 30),
+    Font = Enum.Font.GothamBold,
+    Text = "Set key",
+    TextColor3 = C.dim,
+    TextSize = 12,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+}, { corner(8) })
+
+UIX.antiflingBtn = UIX.makeToggleRow(
+    3,
+    "Antifling",
+    "Other players can't push you, and sudden launches are cancelled and undone."
+)
+
+UIX.noHeadBtn = UIX.makeToggleRow(
+    4,
+    "No head movement",
+    "Your head stays still when you move the camera."
+)
+
+UIX.speedGuiBtn = UIX.makeToggleRow(
+    5,
+    "Speed GUI",
+    "Opens a window with normal walk speed and CFrame walk speed."
+)
+UIX.speedGuiBtn.Text = "OPEN"
+
+-- Bottom bar: Stop + count + mode button
+local bottom = new("Frame", {
+    Parent = body,
+    AnchorPoint = Vector2.new(0, 1),
+    BackgroundTransparency = 1,
+    Position = UDim2.new(0, 8, 1, -8),
+    Size = UDim2.new(1, -44, 0, 28),
+}, {
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+    }),
+})
+
+UIX.stopBtn = new("TextButton", {
+    Parent = bottom,
+    LayoutOrder = 1,
+    BackgroundColor3 = C.panel,
+    Size = UDim2.fromOffset(56, 28),
+    Font = Enum.Font.GothamBold,
+    Text = "Stop",
+    TextColor3 = C.text,
+    TextSize = 12,
+}, { corner(7) })
+
+local countLabel = new("TextLabel", {
+    Parent = bottom,
+    LayoutOrder = 2,
+    BackgroundTransparency = 1,
+    Size = UDim2.fromOffset(108, 28),
+    Font = Enum.Font.Gotham,
+    Text = "",
+    TextColor3 = C.dim,
+    TextSize = 11,
+})
+
+UIX.modeBtn = new("TextButton", {
+    Parent = bottom,
+    LayoutOrder = 3,
+    BackgroundColor3 = C.panel,
+    Size = UDim2.fromOffset(96, 28),
+    Font = Enum.Font.GothamBold,
+    Text = "",
+    TextColor3 = C.text,
+    TextSize = 11,
+}, { corner(7) })
+
+UIX.resetBtn = new("TextButton", {
+    Parent = bottom,
+    LayoutOrder = 4,
+    BackgroundColor3 = C.panel,
+    Size = UDim2.fromOffset(48, 28),
+    Font = Enum.Font.GothamBold,
+    Text = "Reset",
+    TextColor3 = C.text,
+    TextSize = 11,
+    Visible = false,
+}, { corner(7) })
+
+-- Resize grip (bottom-right corner)
+UIX.grip = new("TextButton", {
+    Name = "ResizeGrip",
+    Parent = body,
+    AnchorPoint = Vector2.new(1, 1),
+    BackgroundTransparency = 1,
+    Position = UDim2.new(1, -4, 1, -4),
+    Size = UDim2.fromOffset(24, 24),
+    Text = "",
+    ZIndex = 5,
+})
+for i = 1, 3 do
+    local t = i * 6
+    local p = 22 - t * 0.7071
+    new("Frame", {
+        Parent = UIX.grip,
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        BackgroundColor3 = C.accent,
+        BackgroundTransparency = 0.2,
+        BorderSizePixel = 0,
+        Position = UDim2.fromOffset(p, p),
+        Rotation = -45,
+        Size = UDim2.fromOffset(t, 2),
+        ZIndex = 5,
+    })
+end
+
+------------------------------------------------------------------------
+-- Status text
+------------------------------------------------------------------------
+UIX.statusToken = 0
+local function setStatus(text, sticky)
+    statusLabel.Text = text or ""
+    UIX.statusToken = UIX.statusToken + 1
+    if sticky then return end
+    local token = UIX.statusToken
+    task.delay(3.5, function()
+        if token == UIX.statusToken and statusLabel.Parent then
+            statusLabel.Text = ""
+        end
+    end)
+end
+
+------------------------------------------------------------------------
+-- Forward declarations
+------------------------------------------------------------------------
+local render
+local renderBinds
+local startListening
+local updateHighlights
+
+local activeCards = {} -- grid index -> card (only the rows on screen exist)
+local pool = {}
+local renderToken = 0
+
+local function currentCategory()
+    if state.tab == "Packs" then return state.packCategory end
+    return nil
+end
+
+------------------------------------------------------------------------
+-- Playback: emotes
+------------------------------------------------------------------------
+local function getHumanoid()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    return hum, char
+end
+
+local function stopTrack()
+    if state.track then
+        pcall(function() state.track:Stop() end)
+        state.track = nil
+    end
+    state.activeEmote = nil
+    updateHighlights()
+end
+
+function UIX.resolveEmoteAnimationId(emoteId)
+    local ok, objects = pcall(function()
+        return game:GetObjects("rbxassetid://" .. tostring(emoteId))
+    end)
+    if not ok or type(objects) ~= "table" then return nil end
+
+    local found
+    for _, obj in ipairs(objects) do
+        local candidates = obj:IsA("Animation") and { obj } or obj:GetDescendants()
+        for _, d in ipairs(candidates) do
+            if d:IsA("Animation") then
+                local n = tonumber((tostring(d.AnimationId):match("%d+")))
+                if n and n > 0 then
+                    found = n
+                    break
+                end
+            end
+        end
+        pcall(function() obj:Destroy() end)
+        if found then break end
+    end
+    return found
+end
+
+local emoteAnimCache = {}
+local function playEmote(item)
+    local hum = getHumanoid()
+    if not hum then
+        setStatus("No character found")
+        return
+    end
+
+    -- clicking the emote that is already playing turns it off
+    if state.track and state.activeEmote ~= nil and tostring(state.activeEmote) == tostring(item.id) then
+        stopTrack()
+        setStatus("Stopped: " .. item.name)
+        return
+    end
+
+    stopTrack()
+
+    -- Humanoid:PlayEmote tracks are cancelled by the engine as soon as you move.
+    -- With Walk stop OFF we play the animation ourselves (Action priority) so it
+    -- keeps going while walking; with Walk stop ON we use the normal emote path.
+    local function viaEmote()
+        local ok, a, b = pcall(function()
+            return hum:PlayEmoteAndGetAnimTrackById(item.id)
+        end)
+        if ok then
+            if typeof(a) == "Instance" and a:IsA("AnimationTrack") then
+                return a
+            elseif typeof(b) == "Instance" and b:IsA("AnimationTrack") then
+                return b
+            end
+        end
+        return nil
+    end
+
+    local function viaAnimator()
+        local animId = emoteAnimCache[item.id]
+        if not animId then
+            animId = UIX.resolveEmoteAnimationId(item.id)
+            if animId then emoteAnimCache[item.id] = animId end
+        end
+        local animator = hum:FindFirstChildOfClass("Animator")
+        if animId and animator then
+            local anim = Instance.new("Animation")
+            anim.AnimationId = "rbxassetid://" .. tostring(animId)
+            local ok2, t = pcall(function() return animator:LoadAnimation(anim) end)
+            if ok2 and t then
+                t.Priority = Enum.AnimationPriority.Action
+                pcall(function() t:Play() end)
+                return t
+            end
+        end
+        return nil
+    end
+
+    local newTrack
+    if state.walkStop then
+        newTrack = viaEmote() or viaAnimator()
+    else
+        newTrack = viaAnimator() or viaEmote()
+    end
+
+    if not newTrack then
+        setStatus("Couldn't play that (R15 only)")
+        return
+    end
+
+    pcall(function() newTrack.Looped = true end)
+    pcall(function() newTrack:AdjustSpeed(state.speed) end)
+
+    state.track = newTrack
+    state.activeEmote = item.id
+    updateHighlights()
+    setStatus("Playing: " .. item.name)
+
+    newTrack.Stopped:Connect(function()
+        if state.track == newTrack then
+            state.track = nil
+            state.activeEmote = nil
+            updateHighlights()
+        end
+    end)
+end
+
+------------------------------------------------------------------------
+-- Playback: anim packs (whole pack or a single category)
+------------------------------------------------------------------------
+function UIX.resolveMappings(bundledItems)
+    local mappings = {}
+    for _, group in pairs(bundledItems) do
+        local ids = type(group) == "table" and group or { group }
+        for _, assetId in pairs(ids) do
+            local ok, objects = pcall(function()
+                return game:GetObjects("rbxassetid://" .. tostring(assetId))
+            end)
+            if ok and type(objects) == "table" then
+                for _, root in ipairs(objects) do
+                    for _, d in ipairs(root:GetDescendants()) do
+                        if d:IsA("Animation") and d.Parent then
+                            local weights = {}
+                            for _, w in ipairs(d:GetChildren()) do
+                                if w:IsA("NumberValue") and w.Name == "Weight" then
+                                    table.insert(weights, w.Value)
+                                end
+                            end
+                            table.insert(mappings, {
+                                category = d.Parent.Name,
+                                name = d.Name,
+                                animationId = d.AnimationId,
+                                weights = weights,
+                            })
+                        end
+                    end
+                    pcall(function() root:Destroy() end)
+                end
+            end
+        end
+    end
+    return mappings
+end
+
+function UIX.setAnim(obj, m)
+    obj.AnimationId = m.animationId
+    if m.weights then
+        for _, child in ipairs(obj:GetChildren()) do
+            if child:IsA("NumberValue") and child.Name == "Weight" then
+                child:Destroy()
+            end
+        end
+        for _, value in ipairs(m.weights) do
+            local w = Instance.new("NumberValue")
+            w.Name = "Weight"
+            w.Value = value
+            w.Parent = obj
+        end
+    end
+end
+
+-- Remember the character's original animations the first time a pack is applied,
+-- so clicking an applied pack again can put them back.
+function UIX.ensureSnapshot(char, animate)
+    if state.snapshot and state.snapshot.char == char then return end
+    local folders = {}
+    for _, child in ipairs(animate:GetChildren()) do
+        if child:IsA("StringValue") or child:IsA("Folder") then
+            local hasAnim = false
+            for _, d in ipairs(child:GetChildren()) do
+                if d:IsA("Animation") then hasAnim = true break end
+            end
+            if hasAnim then
+                local ok, copy = pcall(function() return child:Clone() end)
+                if ok and copy then folders[child.Name] = copy end
+            end
+        end
+    end
+    state.snapshot = { char = char, folders = folders }
+end
+
+local function restoreDefaults(animate, category)
+    local snap = state.snapshot
+    if not snap then return false end
+    for name, original in pairs(snap.folders) do
+        if not category or name:lower() == category then
+            local live = animate:FindFirstChild(name)
+            if live then
+                for _, ch in ipairs(live:GetChildren()) do
+                    if ch:IsA("Animation") then ch:Destroy() end
+                end
+                for _, ch in ipairs(original:GetChildren()) do
+                    ch:Clone().Parent = live
+                end
+            end
+        end
+    end
+    return true
+end
+
+local function restartAnimate(hum, animate)
+    for _, t in ipairs(hum:GetPlayingAnimationTracks()) do
+        t:Stop()
+    end
+    if hum.MoveDirection.Magnitude == 0 then
+        animate.Disabled = true
+        animate.Disabled = false
+    end
+end
+
+local applyingPack = false
+local function applyPack(item, category)
+    if applyingPack then return end
+    local hum, char = getHumanoid()
+    local animate = char and char:FindFirstChild("Animate")
+    if not hum or not animate then
+        setStatus("No Animate script on character")
+        return
+    end
+
+    -- clicking the pack that is already applied puts the original animations back
+    local isActive
+    if category then
+        isActive = state.activeParts[category] ~= nil and tostring(state.activeParts[category]) == tostring(item.id)
+    else
+        isActive = state.activePack ~= nil and tostring(state.activePack) == tostring(item.id)
+    end
+    if isActive then
+        if restoreDefaults(animate, category) then
+            if category then
+                state.activeParts[category] = nil
+            else
+                state.activePack = nil
+                state.activeParts = {}
+            end
+            state.track = nil
+            state.activeEmote = nil
+            restartAnimate(hum, animate)
+            updateHighlights()
+            setStatus("Reset " .. (category or "all animations") .. " to default")
+        else
+            setStatus("Nothing to reset")
+        end
+        return
+    end
+
+    if not item.bundledItems then
+        setStatus("No animation data for that pack")
+        return
+    end
+
+    applyingPack = true
+    setStatus("Loading " .. item.name .. "...")
+
+    task.spawn(function()
+        local key = tostring(item.id)
+        local mappings = mappingCache[key]
+        if not mappings or #mappings == 0 then
+            mappings = UIX.resolveMappings(item.bundledItems)
+            if #mappings > 0 then
+                mappingCache[key] = mappings
+                savePackCacheSoon()
+            end
+        end
+
+        if #mappings == 0 then
+            applyingPack = false
+            setStatus("Couldn't load that pack")
+            return
+        end
+
+        local wanted = mappings
+        if category then
+            wanted = {}
+            for _, m in ipairs(mappings) do
+                if tostring(m.category):lower() == category then
+                    table.insert(wanted, m)
+                end
+            end
+            if #wanted == 0 then
+                applyingPack = false
+                setStatus("That pack has no " .. category .. " animation")
+                return
+            end
+        end
+
+        local hum2, char2 = getHumanoid()
+        local animate2 = char2 and char2:FindFirstChild("Animate")
+        if not hum2 or not animate2 then
+            applyingPack = false
+            return
+        end
+
+        UIX.ensureSnapshot(char2, animate2)
+
+        for _, t in ipairs(hum2:GetPlayingAnimationTracks()) do
+            t:Stop()
+        end
+        state.track = nil
+        state.activeEmote = nil
+
+        local byCategory = {}
+        for _, m in ipairs(wanted) do
+            local cat = tostring(m.category):lower()
+            byCategory[cat] = byCategory[cat] or { folder = m.category, items = {} }
+            byCategory[cat].items[tostring(m.name):lower()] = m
+        end
+
+        for _, data in pairs(byCategory) do
+            local folder = animate2:FindFirstChild(data.folder)
+            if folder then
+                local remaining = {}
+                for k, m in pairs(data.items) do remaining[k] = m end
+
+                for _, obj in ipairs(folder:GetChildren()) do
+                    if obj:IsA("Animation") then
+                        local lower = obj.Name:lower()
+                        local m = remaining[lower]
+                        if m then
+                            remaining[lower] = nil
+                            UIX.setAnim(obj, m)
+                            if obj.Name ~= m.name then obj.Name = m.name end
+                        else
+                            obj:Destroy()
+                        end
+                    end
+                end
+
+                for _, m in pairs(remaining) do
+                    local obj = Instance.new("Animation")
+                    obj.Name = m.name
+                    UIX.setAnim(obj, m)
+                    obj.Parent = folder
+                end
+            end
+        end
+
+        if hum2.MoveDirection.Magnitude == 0 then
+            animate2.Disabled = true
+            animate2.Disabled = false
+        end
+
+        if category then
+            state.activeParts[category] = item.id
+            state.activePack = nil
+        else
+            state.activePack = item.id
+            state.activeParts = {}
+        end
+        updateHighlights()
+        applyingPack = false
+        setStatus((category and ("Applied " .. category .. ": ") or "Applied: ") .. item.name)
+    end)
+end
+
+------------------------------------------------------------------------
+-- Speed control
+------------------------------------------------------------------------
+function UIX.round2(v)
+    return math.floor(v * 100 + 0.5) / 100
+end
+
+local function refreshSpeedVisuals()
+    local frac = math.clamp((state.speed - UIX.SPEED_MIN) / (UIX.SPEED_MAX - UIX.SPEED_MIN), 0, 1)
+    UIX.knob.Position = UDim2.new(frac, 0, 0.5, 0)
+    UIX.fill.Size = UDim2.new(frac, 0, 1, 0)
+    UIX.speedBox.Text = tostring(state.speed)
+end
+
+local function setSpeed(v)
+    v = UIX.round2(math.clamp(v, UIX.SPEED_MIN, UIX.SPEED_BOX_MAX))
+    state.speed = v
+    refreshSpeedVisuals()
+    if state.track then
+        pcall(function() state.track:AdjustSpeed(v) end)
+    end
+end
+
+local function setSpeedFromX(x)
+    local abs = UIX.track.AbsolutePosition.X
+    local width = UIX.track.AbsoluteSize.X
+    if width <= 0 then return end
+    local frac = math.clamp((x - abs) / width, 0, 1)
+    setSpeed(UIX.SPEED_MIN + frac * (UIX.SPEED_MAX - UIX.SPEED_MIN))
+end
+
+UIX.speedBox.FocusLost:Connect(function()
+    local cleaned = (UIX.speedBox.Text:gsub("[^%d%.]", ""))
+    local n = tonumber(cleaned)
+    if n then
+        setSpeed(n)
+    else
+        refreshSpeedVisuals()
+    end
+    saveSettings()
+end)
+
+UIX.speedReset.MouseButton1Click:Connect(function()
+    setSpeed(1)
+    saveSettings()
+    setStatus("Speed reset to 1x")
+end)
+
+refreshSpeedVisuals()
+
+------------------------------------------------------------------------
+-- Binds (data + actions)
+------------------------------------------------------------------------
+local listening = nil -- { kind, id, name, bundledItems, category }
+
+local function sameTarget(a, b)
+    return a.kind == b.kind
+        and tostring(a.id) == tostring(b.id)
+        and (a.category or "") == (b.category or "")
+end
+
+local function findBindFor(item, category)
+    local probe = { kind = item.kind, id = item.id, category = category }
+    for _, b in ipairs(state.binds) do
+        if sameTarget(b, probe) then return b end
+    end
+    return nil
+end
+
+function UIX.bindDescription(b)
+    if b.kind == "emote" then return "Emote" end
+    return "Anim pack - " .. (b.category and UIX.capitalize(b.category) or "Full")
+end
+
+local function refreshBindLabels()
+    local cat = currentCategory()
+    for _, card in pairs(activeCards) do
+        if card.item then
+            local b = findBindFor(card.item, cat)
+            card.bindBtn.Text = b and keyLabel(b.key) or "BIND"
+            card.bindBtn.TextColor3 = b and C.accent or C.text
+        end
+    end
+    if state.tab == "Binds" then
+        renderBinds()
+    end
+end
+
+local function assignBind(target, keyName)
+    local replaced
+    for i = #state.binds, 1, -1 do
+        local b = state.binds[i]
+        if b.key == keyName and not sameTarget(b, target) then
+            replaced = b
+        end
+        if b.key == keyName or sameTarget(b, target) then
+            table.remove(state.binds, i)
+        end
+    end
+    table.insert(state.binds, decorate({
+        key = keyName,
+        kind = target.kind,
+        id = target.id,
+        name = target.name,
+        bundledItems = target.bundledItems,
+        category = target.category,
+    }))
+    rebuildBindIndex()
+    saveBinds()
+    refreshBindLabels()
+    if replaced then
+        setStatus(("%s now runs %s (replaced %s)"):format(keyLabel(keyName), target.name, replaced.name))
+    else
+        setStatus(("Bound %s to %s"):format(keyLabel(keyName), target.name))
+    end
+end
+
+local function removeBind(bind)
+    for i, b in ipairs(state.binds) do
+        if b == bind then
+            table.remove(state.binds, i)
+            break
+        end
+    end
+    rebuildBindIndex()
+    saveBinds()
+    refreshBindLabels()
+end
+
+startListening = function(item, category)
+    listening = {
+        kind = item.kind,
+        id = item.id,
+        name = item.name,
+        bundledItems = item.bundledItems,
+        category = category,
+    }
+    setStatus("Press a key for " .. item.name .. " (Esc = cancel)", true)
+end
+
+local function runBind(bind)
+    if bind.kind == "emote" then
+        if state.track and tostring(state.activeEmote) == tostring(bind.id) then
+            stopTrack()
+            setStatus("Stopped")
+        else
+            playEmote(bind)
+        end
+    else
+        applyPack(bind, bind.category)
+    end
+end
+
+local conns = {}
+local noclipKeyListening = false
+state.noclipKeyChanged = function() end -- replaced once the Settings buttons exist
+
+table.insert(conns, UserInputService.InputBegan:Connect(function(input, processed)
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    if noclipKeyListening then
+        local name = input.KeyCode.Name
+        if input.KeyCode == Enum.KeyCode.Escape then
+            noclipKeyListening = false
+            setStatus("Noclip key cancelled")
+            state.noclipKeyChanged()
+        elseif input.KeyCode == Enum.KeyCode.Unknown then
+            return
+        elseif RESERVED_KEYS[name] then
+            setStatus("That key is reserved - pick another", true)
+        elseif bindsByKey[name] then
+            setStatus("That key is used by a bind - pick another", true)
+        else
+            noclipKeyListening = false
+            state.noclipKey = name
+            saveSettings()
+            setStatus("Noclip key set to " .. keyLabel(name))
+            state.noclipKeyChanged()
+        end
+        return
+    end
+
+    if listening then
+        local target = listening
+        if input.KeyCode == Enum.KeyCode.Escape then
+            listening = nil
+            setStatus("Bind cancelled")
+        elseif input.KeyCode == Enum.KeyCode.Unknown then
+            return
+        elseif RESERVED_KEYS[input.KeyCode.Name] then
+            setStatus("That key is reserved - pick another", true)
+        elseif state.noclipKey and input.KeyCode.Name == state.noclipKey then
+            setStatus("That key toggles noclip - pick another", true)
+        else
+            listening = nil
+            assignBind(target, input.KeyCode.Name)
+        end
+        return
+    end
+
+    if UserInputService:GetFocusedTextBox() then return end
+
+    if state.noclipKey and input.KeyCode.Name == state.noclipKey then
+        if state.toggleNoclip then state.toggleNoclip() end
+        return
+    end
+
+    -- `processed` is ignored on purpose: Roblox marks number keys (the hotbar) and
+    -- many game-used keys as already handled, which made those binds do nothing.
+    -- Typing in a text box is still skipped above.
+    if not state.bindsEnabled then
+        if bindsByKey[input.KeyCode.Name] then
+            setStatus("Keybinds are OFF - turn them on in the Binds tab")
+        end
+        return
+    end
+
+    local bind = bindsByKey[input.KeyCode.Name]
+    if bind then
+        local ok, err = pcall(runBind, bind)
+        if not ok then setStatus("Bind error: " .. tostring(err)) end
+    end
+end))
+
+------------------------------------------------------------------------
+-- Item list helpers
+------------------------------------------------------------------------
+local function splitWords(query)
+    local words = {}
+    for word in query:gmatch("%S+") do words[#words + 1] = word end
+    return words
+end
+
+local sfind = string.find
+local function matchWords(item, words)
+    local name, sid = item.lname, item.sid
+    for i = 1, #words do
+        local w = words[i]
+        if not sfind(name, w, 1, true) and not sfind(sid, w, 1, true) then
+            return false
+        end
+    end
+    return true
+end
+
+local function matches(item, query) -- small lists (binds)
+    return matchWords(item, splitWords(query))
+end
+
+-- Filters `pool` for `query`. With `shouldAbort` it yields every few thousand
+-- items so typing in a 50k-item list never freezes the game.
+local function filterList(pool, query, shouldAbort)
+    local words = splitWords(query)
+    local out, n = {}, 0
+    for i = 1, #pool do
+        local item = pool[i]
+        if matchWords(item, words) then
+            n = n + 1
+            out[n] = item
+        end
+        if shouldAbort and i % 10000 == 0 then
+            task.wait()
+            if shouldAbort() then return nil end
+        end
+    end
+    return out
+end
+
+local function sourceForTab()
+    if state.tab == "Emotes" then
+        return state.emotes
+    elseif state.tab == "Packs" then
+        return state.packs
+    end
+    return state.favorites
+end
+
+local function currentList()
+    local source = sourceForTab()
+    if state.search == "" then return source end
+
+    local c = state.filterCache
+    if c and c.source == source and c.query == state.search then
+        return c.list
+    end
+    local out = filterList(source, state.search, nil)
+    state.filterCache = { source = source, query = state.search, list = out }
+    return out
+end
+
+local function thumbUrl(item)
+    if item.kind == "pack" then
+        return "rbxthumb://type=BundleThumbnail&id=" .. tostring(item.id) .. "&w=150&h=150"
+    end
+    return "rbxthumb://type=Asset&id=" .. tostring(item.id) .. "&w=150&h=150"
+end
+
+local function updateCount()
+    if state.tab == "Settings" then
+        countLabel.Text = ""
+    elseif state.tab == "Binds" then
+        countLabel.Text = (#state.binds == 1) and "1 bind" or (#state.binds .. " binds")
+    else
+        countLabel.Text = (#state.view == 1) and "1 item" or (#state.view .. " items")
+    end
+end
+
+local function updateModeButton()
+    if state.tab == "Binds" then
+        UIX.modeBtn.Text = state.bindsEnabled and "Binds: ON" or "Binds: OFF"
+        UIX.modeBtn.TextColor3 = state.bindsEnabled and C.accent or C.dim
+    end
+    UIX.modeBtn.Visible = state.tab == "Binds" -- only the Binds on/off switch remains
+end
+
+------------------------------------------------------------------------
+-- Pooled cards
+------------------------------------------------------------------------
+local function createCard()
+    local card = {}
+
+    card.frame = new("Frame", {
+        Name = "Card",
+        BackgroundColor3 = C.panel,
+        BorderSizePixel = 0,
+        Size = UDim2.fromOffset(CELL_W, CELL_H),
+    }, { corner(8) })
+
+    card.stroke = new("UIStroke", {
+        Parent = card.frame,
+        Color = C.accent,
+        Thickness = 2,
+        Enabled = false,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    })
+
+    card.thumb = new("ImageButton", {
+        Name = "Thumb",
+        Parent = card.frame,
+        BackgroundColor3 = C.dark,
+        BorderSizePixel = 0,
+        Position = UDim2.fromOffset(4, 4),
+        Size = UDim2.fromOffset(CELL_W - 8, CELL_W - 8),
+        ScaleType = Enum.ScaleType.Fit,
+        AutoButtonColor = false,
+    })
+
+    card.name = new("TextLabel", {
+        Parent = card.frame,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(4, CELL_W - 2),
+        Size = UDim2.new(1, -8, 0, CELL_H - CELL_W - 2),
+        Font = Enum.Font.GothamMedium,
+        TextColor3 = C.text,
+        TextSize = 12,
+        TextWrapped = true,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        TextYAlignment = Enum.TextYAlignment.Top,
+    })
+
+    card.tag = new("TextLabel", {
+        Parent = card.thumb,
+        BackgroundColor3 = Color3.new(0, 0, 0),
+        BackgroundTransparency = 0.35,
+        Position = UDim2.new(0, 3, 1, -17),
+        Size = UDim2.fromOffset(38, 14),
+        Font = Enum.Font.GothamBold,
+        TextColor3 = C.text,
+        TextSize = 9,
+        ZIndex = 3,
+        Visible = false,
+    }, { corner(4) })
+
+    card.star = new("TextButton", {
+        Parent = card.thumb,
+        BackgroundColor3 = Color3.new(0, 0, 0),
+        BackgroundTransparency = 0.35,
+        Position = UDim2.new(1, -25, 0, 3),
+        Size = UDim2.fromOffset(22, 22),
+        Font = Enum.Font.SourceSansBold,
+        TextSize = 18,
+        ZIndex = 3,
+    }, { corner(11) })
+
+    card.bindBtn = new("TextButton", {
+        Parent = card.thumb,
+        BackgroundColor3 = Color3.new(0, 0, 0),
+        BackgroundTransparency = 0.35,
+        Position = UDim2.fromOffset(3, 3),
+        Size = UDim2.fromOffset(36, 18),
+        Font = Enum.Font.GothamBold,
+        Text = "BIND",
+        TextColor3 = C.text,
+        TextScaled = true,
+        ZIndex = 3,
+    }, {
+        corner(5),
+        new("UITextSizeConstraint", { MaxTextSize = 10, MinTextSize = 6 }),
+        new("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2) }),
+    })
+
+    -- connections are made once; they always read card.item
+    card.thumb.MouseButton1Click:Connect(function()
+        local item = card.item
+        if not item then return end
+        if item.kind == "pack" then
+            applyPack(item, currentCategory())
+        else
+            playEmote(item)
+        end
+    end)
+
+    card.thumb.MouseButton2Click:Connect(function()
+        if card.item then
+            startListening(card.item, card.item.kind == "pack" and currentCategory() or nil)
+        end
+    end)
+
+    card.bindBtn.MouseButton1Click:Connect(function()
+        local item = card.item
+        if not item then return end
+        local cat = item.kind == "pack" and currentCategory() or nil
+        local existing = findBindFor(item, cat)
+        if existing then
+            -- already bound: clicking the key again removes the bind
+            removeBind(existing)
+            setStatus("Removed bind " .. keyLabel(existing.key) .. " from " .. item.name)
+        else
+            startListening(item, cat)
+        end
+    end)
+
+    card.star.MouseButton1Click:Connect(function()
+        local item = card.item
+        if not item then return end
+        local nowFav = toggleFavorite(item)
+        card.star.Text = nowFav and "★" or "☆"
+        card.star.TextColor3 = nowFav and C.gold or C.text
+        setStatus((nowFav and "Favorited: " or "Removed: ") .. item.name)
+
+        if state.tab == "Favorites" and not nowFav then
+            -- drop it from the visible list and re-lay the grid
+            if state.view ~= state.favorites then
+                for i, v in ipairs(state.view) do
+                    if favKey(v.kind, v.id) == favKey(item.kind, item.id) then
+                        table.remove(state.view, i)
+                        break
+                    end
+                end
+            end
+            state.relayout(true)
+            updateCount()
+            if #state.view == 0 then render() end
+        end
+    end)
+
+    return card
+end
+
+local function acquireCard()
+    return table.remove(pool) or createCard()
+end
+
+local function bindCard(card, item, order)
+    card.item = item
+    card.frame.LayoutOrder = order
+    card.thumb.Image = ""
+    card.wantImage = thumbUrl(item) -- set a moment later, once scrolling slows down
+    card.name.Text = tostring(item.name)
+    card.stroke.Enabled = false
+
+    if state.tab == "Favorites" then
+        card.tag.Visible = true
+        card.tag.Text = item.kind == "pack" and "PACK" or "EMOTE"
+    else
+        card.tag.Visible = false
+    end
+
+    local isFav = state.favSet[favKey(item.kind, item.id)] == true
+    card.star.Text = isFav and "★" or "☆"
+    card.star.TextColor3 = isFav and C.gold or C.text
+
+    local b = findBindFor(item, item.kind == "pack" and currentCategory() or nil)
+    card.bindBtn.Text = b and keyLabel(b.key) or "BIND"
+    card.bindBtn.TextColor3 = b and C.accent or C.text
+end
+
+local function releaseCard(card)
+    card.frame.Parent = nil
+    card.item = nil
+    card.wantImage = nil
+    card.thumb.Image = ""
+    table.insert(pool, card)
+end
+
+local function releaseAllCards()
+    for idx, card in pairs(activeCards) do
+        releaseCard(card)
+        activeCards[idx] = nil
+    end
+end
+
+updateHighlights = function()
+    local cat = currentCategory()
+    for _, card in pairs(activeCards) do
+        local item = card.item
+        local active = false
+        if item then
+            if item.kind == "emote" then
+                active = state.activeEmote ~= nil and tostring(state.activeEmote) == item.sid
+            elseif cat then
+                active = state.activeParts[cat] ~= nil and tostring(state.activeParts[cat]) == item.sid
+            else
+                active = state.activePack ~= nil and tostring(state.activePack) == item.sid
+            end
+        end
+        if card.stroke.Enabled ~= active then card.stroke.Enabled = active end
+    end
+    refreshChipLabels()
+end
+
+------------------------------------------------------------------------
+-- Virtual grid: only the rows on screen (plus one above and below) exist,
+-- so scrolling through thousands of items stays smooth.
+------------------------------------------------------------------------
+-- Thumbnails are requested only after scrolling pauses briefly, so flicking
+-- through thousands of rows doesn't fire thousands of image loads.
+local imageToken = 0
+state.scheduleImages = function()
+    imageToken = imageToken + 1
+    local token = imageToken
+    task.delay(0.07, function()
+        if token ~= imageToken then return end
+        for _, card in pairs(activeCards) do
+            local want = card.wantImage
+            if want and card.thumb.Image ~= want then
+                card.thumb.Image = want
+            end
+        end
+    end)
+end
+
+local ROW_H = CELL_H + PAD
+local layoutCols = 0
+local layoutQueued = false
+local canvasRows = -1
+
+local function layoutVisible(force)
+    if state.tab == "Binds" or state.tab == "Settings" then return end
+    local view = state.view
+    local total = #view
+    local width = listFrame.AbsoluteSize.X - 10 -- room for the scroll bar
+    local cols = math.max(1, math.floor((width + PAD) / (CELL_W + PAD)))
+    local rows = math.ceil(total / cols)
+
+    if cols ~= layoutCols then
+        force = true
+        layoutCols = cols
+    end
+    if rows ~= canvasRows then
+        canvasRows = rows
+        listFrame.CanvasSize = UDim2.fromOffset(0, rows > 0 and (rows * ROW_H + PAD) or 0)
+    end
+
+    local y = listFrame.CanvasPosition.Y
+    local winH = listFrame.AbsoluteSize.Y
+    local firstRow = math.max(0, math.floor(y / ROW_H) - 1)
+    local lastRow = math.min(rows - 1, math.floor((y + winH) / ROW_H) + 1)
+    local first = firstRow * cols + 1
+    local last = math.min(total, (lastRow + 1) * cols)
+
+    for idx, card in pairs(activeCards) do
+        if force or idx < first or idx > last then
+            releaseCard(card)
+            activeCards[idx] = nil
+        end
+    end
+
+    for idx = first, last do
+        if not activeCards[idx] then
+            local card = acquireCard()
+            activeCards[idx] = card
+            bindCard(card, view[idx], idx)
+            local r = (idx - 1) // cols
+            local c = (idx - 1) % cols
+            card.frame.Position = UDim2.fromOffset(2 + c * (CELL_W + PAD), PAD + r * ROW_H)
+            card.frame.Parent = listFrame
+        end
+    end
+    updateHighlights()
+    state.scheduleImages()
+end
+state.relayout = layoutVisible
+
+-- coalesce scroll/resize events so the grid updates at most once per frame
+local function queueLayout()
+    if layoutQueued then return end
+    layoutQueued = true
+    task.defer(function()
+        layoutQueued = false
+        layoutVisible(false)
+    end)
+end
+
+listFrame:GetPropertyChangedSignal("CanvasPosition"):Connect(queueLayout)
+listFrame:GetPropertyChangedSignal("AbsoluteSize"):Connect(queueLayout)
+
+render = function()
+    renderToken = renderToken + 1
+
+    UIX.settingsPanel.Visible = state.tab == "Settings"
+    if state.tab == "Settings" then
+        if state.refreshSettings then state.refreshSettings() end
+        listFrame.Visible = false
+        bindList.Visible = false
+        emptyLabel.Visible = false
+        releaseAllCards()
+        updateCount()
+        return
+    end
+
+    if state.tab == "Binds" then
+        listFrame.Visible = false
+        bindList.Visible = true
+        releaseAllCards()
+        renderBinds()
+        return
+    end
+
+    bindList.Visible = false
+    listFrame.Visible = true
+    releaseAllCards()
+
+    state.view = currentList()
+    listFrame.CanvasPosition = Vector2.new(0, 0)
+
+    local loading = (state.tab == "Emotes" and state.loadingEmotes) or (state.tab == "Packs" and state.loadingPacks)
+    if #state.view == 0 then
+        emptyLabel.Visible = true
+        if loading then
+            emptyLabel.Text = "Loading..."
+        elseif state.search ~= "" then
+            emptyLabel.Text = "Nothing matches your search."
+        elseif state.tab == "Favorites" then
+            emptyLabel.Text = "No favorites yet.\nPress the star on any emote or anim pack to add it here."
+        else
+            emptyLabel.Text = "Nothing to show."
+        end
+    else
+        emptyLabel.Visible = false
+    end
+
+    updateCount()
+    layoutVisible(true)
+end
+
+------------------------------------------------------------------------
+-- Binds tab rows
+------------------------------------------------------------------------
+local function makeBindRow(bind, order)
+    local row = new("Frame", {
+        Name = "Row",
+        Parent = bindList,
+        LayoutOrder = order,
+        BackgroundColor3 = C.panel,
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 44),
+    }, { corner(8) })
+
+    new("ImageLabel", {
+        Parent = row,
+        BackgroundColor3 = C.dark,
+        BorderSizePixel = 0,
+        Position = UDim2.fromOffset(4, 4),
+        Size = UDim2.fromOffset(36, 36),
+        Image = thumbUrl(bind),
+        ScaleType = Enum.ScaleType.Fit,
+    })
+
+    new("TextLabel", {
+        Parent = row,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(48, 5),
+        Size = UDim2.new(1, -48 - 104, 0, 18),
+        Font = Enum.Font.GothamBold,
+        Text = tostring(bind.name),
+        TextColor3 = C.text,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+
+    new("TextLabel", {
+        Parent = row,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(48, 24),
+        Size = UDim2.new(1, -48 - 104, 0, 14),
+        Font = Enum.Font.Gotham,
+        Text = UIX.bindDescription(bind),
+        TextColor3 = C.dim,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+
+    local keyBtn = new("TextButton", {
+        Parent = row,
+        AnchorPoint = Vector2.new(1, 0.5),
+        BackgroundColor3 = C.panelHi,
+        Position = UDim2.new(1, -36, 0.5, 0),
+        Size = UDim2.fromOffset(62, 26),
+        Font = Enum.Font.GothamBold,
+        Text = keyLabel(bind.key),
+        TextColor3 = C.accent,
+        TextScaled = true,
+    }, {
+        corner(6),
+        new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 7 }),
+        new("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4) }),
+    })
+    keyBtn.MouseButton1Click:Connect(function()
+        startListening(bind, bind.category)
+    end)
+
+    local delBtn = new("TextButton", {
+        Parent = row,
+        AnchorPoint = Vector2.new(1, 0.5),
+        BackgroundColor3 = C.red,
+        Position = UDim2.new(1, -6, 0.5, 0),
+        Size = UDim2.fromOffset(26, 26),
+        Font = Enum.Font.GothamBold,
+        Text = "X",
+        TextColor3 = Color3.new(1, 1, 1),
+        TextSize = 12,
+    }, { corner(6) })
+    delBtn.MouseButton1Click:Connect(function()
+        removeBind(bind)
+        setStatus("Removed bind: " .. bind.name)
+    end)
+end
+
+renderBinds = function()
+    for _, child in ipairs(bindList:GetChildren()) do
+        if child.Name == "Row" then child:Destroy() end
+    end
+
+    local shownCount = 0
+    for _, bind in ipairs(state.binds) do
+        if state.search == "" or matches(bind, state.search) then
+            shownCount = shownCount + 1
+            makeBindRow(bind, shownCount)
+        end
+    end
+
+    if shownCount == 0 then
+        emptyLabel.Visible = true
+        if #state.binds == 0 then
+            emptyLabel.Text = "No binds yet.\nPress BIND on any emote or anim pack card (or right-click it), then press a key.\nOn the Anim Packs tab, use the chips at the bottom (Idle, Walk, Run, Jump, Fall) to bind just that part of a pack."
+        else
+            emptyLabel.Text = "Nothing matches your search."
+        end
+    else
+        emptyLabel.Visible = false
+    end
+    updateCount()
+end
+
+------------------------------------------------------------------------
+-- Tabs, dropdown, search, stop, mode button
+------------------------------------------------------------------------
+local function updateChips()
+    for i, cat in ipairs(PACK_CATS) do
+        local active = cat.key == state.packCategory
+        chipButtons[i].BackgroundColor3 = active and C.accent or C.panel
+        chipButtons[i].TextColor3 = active and C.dark or C.text
+    end
+end
+
+for i, cat in ipairs(PACK_CATS) do
+    chipButtons[i].MouseButton1Click:Connect(function()
+        state.packCategory = cat.key
+        saveSettings()
+        updateChips()
+        if state.tab == "Packs" then render() end
+    end)
+end
+
+local function setTab(name)
+    state.tab = name
+    for tabName, btn in pairs(tabButtons) do
+        local active = tabName == name
+        btn.BackgroundColor3 = active and C.accent or C.panel
+        btn.TextColor3 = active and C.dark or C.text
+    end
+
+    -- the chip row takes space at the bottom on the Anim Packs tab
+    local isPacks = name == "Packs"
+    UIX.chipRow.Visible = isPacks
+    local areaSize = UDim2.new(1, -16, 1, isPacks and -192 or -152)
+    listFrame.Size = areaSize
+    bindList.Size = areaSize
+    emptyLabel.Size = areaSize
+    UIX.settingsPanel.Size = areaSize
+    searchBox.Visible = name ~= "Settings"
+
+    UIX.resetBtn.Visible = isPacks
+    refreshChipLabels()
+
+    updateModeButton()
+    render()
+    saveSettings()
+end
+
+for name, btn in pairs(tabButtons) do
+    btn.MouseButton1Click:Connect(function() setTab(name) end)
+end
+
+UIX.modeBtn.MouseButton1Click:Connect(function()
+    if state.tab == "Binds" then
+        state.bindsEnabled = not state.bindsEnabled
+        setStatus(state.bindsEnabled and "Keybinds enabled" or "Keybinds disabled")
+    end
+    updateModeButton()
+    saveSettings()
+end)
+
+------------------------------------------------------------------------
+-- Noclip
+------------------------------------------------------------------------
+local noclipOriginal = {} -- part -> original CanCollide
+
+local function restoreCollisions()
+    for part, original in pairs(noclipOriginal) do
+        pcall(function() part.CanCollide = original end)
+        noclipOriginal[part] = nil
+    end
+end
+
+UIX.noclipParts, UIX.noclipChar, UIX.noclipRefreshAt = {}, nil, 0
+
+table.insert(conns, RunService.Stepped:Connect(function()
+    if not state.noclip then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+
+    -- the part list is rebuilt twice a second (and on respawn), not every frame
+    local now = os.clock()
+    if char ~= UIX.noclipChar or now >= UIX.noclipRefreshAt then
+        UIX.noclipChar = char
+        UIX.noclipRefreshAt = now + 0.5
+        UIX.noclipParts = {}
+        for _, d in ipairs(char:GetDescendants()) do
+            if d:IsA("BasePart") then UIX.noclipParts[#UIX.noclipParts + 1] = d end
+        end
+    end
+
+    for i = 1, #UIX.noclipParts do
+        local d = UIX.noclipParts[i]
+        if d.CanCollide then
+            noclipOriginal[d] = true
+            d.CanCollide = false
+        end
+    end
+end))
+
+------------------------------------------------------------------------
+-- Anti-fling
+--  1) other players' bodies stop colliding with you (on your screen only), so
+--     they can't push or spin you
+--  2) if something still launches you, the launch is cancelled and you're put
+--     back where you were a moment ago
+------------------------------------------------------------------------
+local safeHistory = {} -- { t = os.clock(), cf = CFrame } while you are moving normally
+local afTouched = setmetatable({}, { __mode = "k" }) -- other players' parts we turned non-collidable
+UIX.afParts, UIX.afRefreshAt = {}, 0
+UIX.afCheck, UIX.afCooldown = 0, 0
+
+local function restoreOthers()
+    for part in pairs(afTouched) do
+        pcall(function() part.CanCollide = true end)
+        afTouched[part] = nil
+    end
+end
+
+table.insert(conns, RunService.Stepped:Connect(function()
+    if not state.antifling then return end
+
+    -- the list of other players' parts is rebuilt a couple of times a second
+    local now = os.clock()
+    if now >= UIX.afRefreshAt then
+        UIX.afRefreshAt = now + 0.4
+        local parts = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and plr.Character then
+                for _, d in ipairs(plr.Character:GetDescendants()) do
+                    if d:IsA("BasePart") then parts[#parts + 1] = d end
+                end
+            end
+        end
+        UIX.afParts = parts
+    end
+
+    local parts = UIX.afParts
+    for i = 1, #parts do
+        local d = parts[i]
+        if d.CanCollide then
+            afTouched[d] = true
+            d.CanCollide = false
+        end
+    end
+end))
+
+table.insert(conns, RunService.Heartbeat:Connect(function(dt)
+    if not state.antifling then return end
+    UIX.afCheck = UIX.afCheck + dt
+    if UIX.afCheck < 0.05 then return end
+    UIX.afCheck = 0
+
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 or hum.Sit then return end -- vehicles are fast on purpose
+
+    local now = os.clock()
+    if now < UIX.afCooldown then return end
+
+    local vel = hrp.AssemblyLinearVelocity
+    local horizontal = Vector3.new(vel.X, 0, vel.Z).Magnitude
+    local spin = hrp.AssemblyAngularVelocity.Magnitude
+
+    -- what counts as "too fast" follows your own WalkSpeed / jump, so speed hacks aren't mistaken for flings
+    local allowed = math.max(120, hum.WalkSpeed * 2.5)
+    local allowedUp = math.max(120, (hum.JumpPower or 50) * 2.5)
+    local flung = horizontal > allowed or vel.Y > allowedUp or spin > 40
+
+    if flung then
+        for _, d in ipairs(char:GetDescendants()) do
+            if d:IsA("BasePart") then
+                d.AssemblyLinearVelocity = Vector3.zero
+                d.AssemblyAngularVelocity = Vector3.zero
+            end
+        end
+
+        -- a spot from just before it happened (at least 0.3s old)
+        local target
+        for i = #safeHistory, 1, -1 do
+            if now - safeHistory[i].t >= 0.3 then target = safeHistory[i].cf break end
+        end
+        if target and (hrp.Position - target.Position).Magnitude > 12 then
+            hrp.CFrame = target
+            for i = #safeHistory, 1, -1 do
+                if safeHistory[i].cf ~= target then table.remove(safeHistory, i) else break end
+            end
+            setStatus("Anti-fling: launch cancelled, put you back")
+        else
+            setStatus("Anti-fling: launch cancelled")
+        end
+        UIX.afCooldown = now + 0.3
+        return
+    end
+
+    -- moving normally: remember where you are
+    if horizontal < allowed * 0.6 and spin < 20 then
+        table.insert(safeHistory, { t = now, cf = hrp.CFrame })
+        while #safeHistory > 0 and now - safeHistory[1].t > 3 do
+            table.remove(safeHistory, 1)
+        end
+    end
+end))
+
+table.insert(conns, LocalPlayer.CharacterAdded:Connect(function()
+    safeHistory = {}
+    noclipOriginal = {}
+    UIX.afCooldown = os.clock() + 1
+end))
+
+------------------------------------------------------------------------
+-- No head movement: keep the neck joint at its normal pose so the head doesn't
+-- turn/tilt with the camera. Runs last in the render step so it wins over
+-- any game script that moves the neck.
+------------------------------------------------------------------------
+UIX.R6_NECK_ROT = CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0)
+UIX.neckOriginal = setmetatable({}, { __mode = "k" })
+UIX.headBound = false
+UIX.HEAD_BIND = "EmoteHubStillHead"
+
+function UIX.keepHeadStill()
+    local char = LocalPlayer.Character
+    if not char then return end
+    local neck = char:FindFirstChild("Neck", true)
+    if not neck or not neck:IsA("Motor6D") then return end
+
+    local o = UIX.neckOriginal[neck]
+    if not o then
+        -- a neck's rotation is normally fixed, so keep only its position and
+        -- rebuild the standard rotation (works even if the head is already turned)
+        local c0p, c1p = neck.C0.Position, neck.C1.Position
+        if char:FindFirstChild("UpperTorso") then
+            o = { C0 = CFrame.new(c0p), C1 = CFrame.new(c1p) }
+        else
+            o = { C0 = CFrame.new(c0p) * UIX.R6_NECK_ROT, C1 = CFrame.new(c1p) * UIX.R6_NECK_ROT }
+        end
+        UIX.neckOriginal[neck] = o
+    end
+    if neck.C0 ~= o.C0 then neck.C0 = o.C0 end
+    if neck.C1 ~= o.C1 then neck.C1 = o.C1 end
+end
+
+local function setHeadStill(on)
+    if on and not UIX.headBound then
+        UIX.headBound = true
+        RunService:BindToRenderStep(UIX.HEAD_BIND, Enum.RenderPriority.Last.Value + 10, UIX.keepHeadStill)
+    elseif not on and UIX.headBound then
+        UIX.headBound = false
+        pcall(function() RunService:UnbindFromRenderStep(UIX.HEAD_BIND) end)
+    end
+end
+setHeadStill(state.noHead)
+table.insert(conns, LocalPlayer.CharacterAdded:Connect(function()
+    UIX.neckOriginal = setmetatable({}, { __mode = "k" })
+end))
+
+------------------------------------------------------------------------
+-- Speed window: normal WalkSpeed and CFrame walk speed
+------------------------------------------------------------------------
+UIX.speedWin = new("Frame", {
+    Name = "SpeedWindow",
+    Parent = gui,
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0,
+    Position = UDim2.fromOffset(20, math.max(10, viewport.Y / 2 - 105)),
+    Size = UDim2.fromOffset(300, 170),
+}, {
+    corner(10),
+    new("UIStroke", { Color = C.accent, Transparency = 0.55, Thickness = 1.5 }),
+})
+
+UIX.speedTitle = new("Frame", {
+    Parent = UIX.speedWin,
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+    Size = UDim2.new(1, 0, 0, 30),
+}, { corner(10) })
+
+new("Frame", { -- squares off the title bar's bottom corners
+    Parent = UIX.speedTitle,
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+    Position = UDim2.new(0, 0, 1, -12),
+    Size = UDim2.new(1, 0, 0, 12),
+})
+
+new("TextLabel", {
+    Parent = UIX.speedTitle,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(12, 0),
+    Size = UDim2.new(1, -50, 1, 0),
+    Font = Enum.Font.GothamBold,
+    Text = "Speed",
+    TextColor3 = C.accent,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+UIX.speedHide = new("TextButton", {
+    Parent = UIX.speedTitle,
+    BackgroundColor3 = C.panelHi,
+    Position = UDim2.new(1, -30, 0, 3),
+    Size = UDim2.fromOffset(24, 24),
+    Font = Enum.Font.GothamBold,
+    Text = "-",
+    TextColor3 = C.text,
+    TextSize = 16,
+}, { corner(6) })
+
+function UIX.makeSpeedRow(y, label, startValue)
+    new("TextLabel", {
+        Parent = UIX.speedWin,
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(12, y),
+        Size = UDim2.fromOffset(88, 30),
+        Font = Enum.Font.GothamBold,
+        Text = label,
+        TextColor3 = C.text,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    })
+    local box = new("TextBox", {
+        Parent = UIX.speedWin,
+        BackgroundColor3 = C.panel,
+        Position = UDim2.fromOffset(102, y),
+        Size = UDim2.fromOffset(50, 30),
+        Font = Enum.Font.GothamBold,
+        Text = tostring(startValue),
+        TextColor3 = C.text,
+        TextSize = 13,
+        ClearTextOnFocus = false,
+    }, { corner(8) })
+    local toggle = new("TextButton", {
+        Parent = UIX.speedWin,
+        BackgroundColor3 = C.panelHi,
+        Position = UDim2.fromOffset(156, y),
+        Size = UDim2.fromOffset(56, 30),
+        Font = Enum.Font.GothamBold,
+        Text = "OFF",
+        TextColor3 = C.dim,
+        TextSize = 13,
+    }, { corner(8) })
+    local reset = new("TextButton", {
+        Parent = UIX.speedWin,
+        BackgroundColor3 = C.panelHi,
+        Position = UDim2.fromOffset(216, y),
+        Size = UDim2.fromOffset(72, 30),
+        Font = Enum.Font.GothamBold,
+        Text = "Reset",
+        TextColor3 = C.accent,
+        TextSize = 13,
+    }, { corner(8) })
+    return box, toggle, reset
+end
+
+UIX.cfBox, UIX.cfToggle, UIX.cfReset = UIX.makeSpeedRow(42, "CFrame speed", state.cfValue)
+
+new("TextLabel", {
+    Parent = UIX.speedWin,
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(12, 84),
+    Size = UDim2.new(1, -24, 0, 80),
+    Font = Enum.Font.Gotham,
+    Text = "CFrame speed moves you forward in studs per second. It works independently of WalkSpeed, so normal movement still feels the same.",
+    TextColor3 = C.dim,
+    TextSize = 10,
+    TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+})
+
+-- drag the speed window by its title bar
+local speedDrag
+UIX.speedTitle.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        speedDrag = { start = Vector2.new(input.Position.X, input.Position.Y), pos = UIX.speedWin.Position }
+    end
+end)
+table.insert(conns, UserInputService.InputChanged:Connect(function(input)
+    if not speedDrag then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local d = Vector2.new(input.Position.X, input.Position.Y) - speedDrag.start
+    UIX.speedWin.Position = UDim2.new(speedDrag.pos.X.Scale, speedDrag.pos.X.Offset + d.X, speedDrag.pos.Y.Scale, speedDrag.pos.Y.Offset + d.Y)
+end))
+table.insert(conns, UserInputService.InputEnded:Connect(function(input)
+    if speedDrag and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+        speedDrag = nil
+    end
+end))
+
+table.insert(conns, RunService.Heartbeat:Connect(function(dt)
+    if not state.cframeSpeedOn then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Sit then return end
+    local dir = hum.MoveDirection
+    if dir.Magnitude > 0 then
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            hrp.CFrame = hrp.CFrame + dir * (state.cfValue * dt)
+        end
+    end
+end))
+
+function UIX.styleToggle(btn, on)
+    btn.Text = on and "ON" or "OFF"
+    btn.TextColor3 = on and C.dark or C.dim
+    btn.BackgroundColor3 = on and C.accent or C.panelHi
+end
+
+local function updateWalkStopBtn()
+    UIX.styleToggle(UIX.walkStopBtn, state.walkStop)
+    UIX.styleToggle(UIX.noclipBtn, state.noclip)
+    UIX.styleToggle(UIX.antiflingBtn, state.antifling)
+    UIX.styleToggle(UIX.noHeadBtn, state.noHead)
+    UIX.styleToggle(UIX.cfToggle, state.cframeSpeedOn)
+    UIX.speedGuiBtn.Text = UIX.speedWin.Visible and "CLOSE" or "OPEN"
+    UIX.speedGuiBtn.TextColor3 = UIX.speedWin.Visible and C.dark or C.dim
+    UIX.speedGuiBtn.BackgroundColor3 = UIX.speedWin.Visible and C.accent or C.panelHi
+end
+updateWalkStopBtn()
+
+state.toggleNoclip = function()
+    state.noclip = not state.noclip
+    if not state.noclip then restoreCollisions() end
+    updateWalkStopBtn()
+    saveSettings()
+end
+
+UIX.noclipBtn.MouseButton1Click:Connect(function()
+    state.toggleNoclip()
+end)
+
+local function updateNoclipKeyBtn()
+    if noclipKeyListening then
+        UIX.noclipKeyBtn.Text = "Press key"
+        UIX.noclipKeyBtn.TextColor3 = C.accent
+        UIX.noclipKeyBtn.BackgroundColor3 = C.panelHi
+    elseif state.noclipKey then
+        UIX.noclipKeyBtn.Text = keyLabel(state.noclipKey)
+        UIX.noclipKeyBtn.TextColor3 = C.dark
+        UIX.noclipKeyBtn.BackgroundColor3 = C.accent
+    else
+        UIX.noclipKeyBtn.Text = "Set key"
+        UIX.noclipKeyBtn.TextColor3 = C.dim
+        UIX.noclipKeyBtn.BackgroundColor3 = C.panelHi
+    end
+end
+updateNoclipKeyBtn()
+state.noclipKeyChanged = updateNoclipKeyBtn
+state.refreshSettings = function()
+    updateWalkStopBtn()
+    updateNoclipKeyBtn()
+end
+
+UIX.noclipKeyBtn.MouseButton1Click:Connect(function()
+    if noclipKeyListening then
+        noclipKeyListening = false
+        setStatus("Noclip key cancelled")
+    elseif state.noclipKey then
+        state.noclipKey = nil
+        saveSettings()
+        setStatus("Noclip key cleared")
+    else
+        listening = nil
+        noclipKeyListening = true
+        setStatus("Press a key for noclip (Esc = cancel)", true)
+    end
+    updateNoclipKeyBtn()
+end)
+
+UIX.speedGuiBtn.MouseButton1Click:Connect(function()
+    UIX.speedWin.Visible = not UIX.speedWin.Visible
+    updateWalkStopBtn()
+end)
+
+UIX.speedHide.MouseButton1Click:Connect(function()
+    UIX.speedWin.Visible = false
+    updateWalkStopBtn()
+end)
+
+UIX.cfToggle.MouseButton1Click:Connect(function()
+    state.cframeSpeedOn = not state.cframeSpeedOn
+    updateWalkStopBtn()
+    saveSettings()
+end)
+
+function UIX.readSpeedBox(box, current)
+    local n = tonumber((box.Text:gsub("[^%d%.]", "")))
+    if not n then
+        box.Text = tostring(current)
+        return current
+    end
+    n = math.clamp(math.floor(n * 100 + 0.5) / 100, 0, 500)
+    box.Text = tostring(n)
+    return n
+end
+
+-- Reset: back to the default number and switched off
+UIX.cfReset.MouseButton1Click:Connect(function()
+    state.cfValue = 50
+    UIX.cfBox.Text = "50"
+    state.cframeSpeedOn = false
+    saveSettings()
+    updateWalkStopBtn()
+    setStatus("CFrame speed reset to 50 and turned off")
+end)
+
+UIX.cfBox.FocusLost:Connect(function()
+    state.cfValue = UIX.readSpeedBox(UIX.cfBox, state.cfValue)
+    saveSettings()
+end)
+
+UIX.noHeadBtn.MouseButton1Click:Connect(function()
+    state.noHead = not state.noHead
+    setHeadStill(state.noHead)
+    updateWalkStopBtn()
+    saveSettings()
+    setStatus(state.noHead and "Head movement off" or "Head movement back on")
+end)
+
+UIX.antiflingBtn.MouseButton1Click:Connect(function()
+    state.antifling = not state.antifling
+    if not state.antifling then restoreOthers() end
+    updateWalkStopBtn()
+    saveSettings()
+    setStatus(state.antifling and "Antifling ON" or "Antifling OFF")
+end)
+
+UIX.walkStopBtn.MouseButton1Click:Connect(function()
+    state.walkStop = not state.walkStop
+    updateWalkStopBtn()
+    saveSettings()
+    setStatus(state.walkStop and "Walk stop ON: walking cancels emotes" or "Walk stop OFF: emotes keep playing while you walk")
+end)
+
+-- Walk stop: cancel the playing emote as soon as the character moves
+UIX.walkCheck = 0
+table.insert(conns, RunService.Heartbeat:Connect(function(dt)
+    if not state.walkStop or not state.track then return end
+    UIX.walkCheck = UIX.walkCheck + dt
+    if UIX.walkCheck < 0.05 then return end
+    UIX.walkCheck = 0
+    local hum = getHumanoid()
+    if hum and hum.MoveDirection.Magnitude > 0.1 then
+        stopTrack()
+        setStatus("Stopped (walk stop)")
+    end
+end))
+
+UIX.resetBtn.MouseButton1Click:Connect(function()
+    local hum, char = getHumanoid()
+    local animate = char and char:FindFirstChild("Animate")
+    if not hum or not animate then
+        setStatus("No Animate script on character")
+        return
+    end
+    if restoreDefaults(animate, nil) then
+        state.activePack = nil
+        state.activeParts = {}
+        state.track = nil
+        state.activeEmote = nil
+        restartAnimate(hum, animate)
+        updateHighlights()
+        setStatus("All animations reset to default")
+    else
+        setStatus("Nothing to reset")
+    end
+end)
+
+UIX.stopBtn.MouseButton1Click:Connect(function()
+    stopTrack()
+    setStatus("Stopped")
+end)
+
+local searchToken = 0
+searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    searchToken = searchToken + 1
+    local token = searchToken
+    task.delay(0.2, function()
+        if token ~= searchToken or not gui.Parent then return end
+        local query = searchBox.Text:match("^%s*(.-)%s*$"):lower()
+        if query == "" then
+            state.search = ""
+            render()
+            return
+        end
+
+        local source = sourceForTab()
+        local c = state.filterCache
+        local pool = source
+        -- typing more letters only needs to look through the previous matches
+        if c and c.source == source and c.query ~= "" and query:sub(1, #c.query) == c.query then
+            pool = c.list
+        end
+        local out = filterList(pool, query, function()
+            return token ~= searchToken or not gui.Parent
+        end)
+        if not out then return end -- a newer search took over
+
+        state.filterCache = { source = source, query = query, list = out }
+        state.search = query
+        render()
+    end)
+end)
+
+------------------------------------------------------------------------
+-- Dragging (move / resize / slider) - one shared input handler
+------------------------------------------------------------------------
+local drag = nil
+
+local function isPointer(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function beginDrag(mode, input)
+    drag = {
+        mode = mode,
+        start = Vector2.new(input.Position.X, input.Position.Y),
+        pos = main.Position,
+        size = main.AbsoluteSize,
+    }
+end
+
+titleBar.InputBegan:Connect(function(input)
+    if isPointer(input) then beginDrag("move", input) end
+end)
+
+UIX.grip.InputBegan:Connect(function(input)
+    if isPointer(input) then beginDrag("resize", input) end
+end)
+
+UIX.sliderHit.InputBegan:Connect(function(input)
+    if isPointer(input) then
+        beginDrag("slider", input)
+        setSpeedFromX(input.Position.X)
+    end
+end)
+
+table.insert(conns, UserInputService.InputChanged:Connect(function(input)
+    if not drag then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement
+        and input.UserInputType ~= Enum.UserInputType.Touch then
+        return
+    end
+
+    local delta = Vector2.new(input.Position.X, input.Position.Y) - drag.start
+    if drag.mode == "move" then
+        main.Position = UDim2.new(
+            drag.pos.X.Scale, drag.pos.X.Offset + delta.X,
+            drag.pos.Y.Scale, drag.pos.Y.Offset + delta.Y
+        )
+    elseif drag.mode == "resize" then
+        local w = math.clamp(drag.size.X + delta.X, UIX.MIN_W, UIX.MAX_W)
+        local h = math.clamp(drag.size.Y + delta.Y, UIX.MIN_H, UIX.MAX_H)
+        sizeNow = Vector2.new(w, h)
+        main.Size = UDim2.fromOffset(w, h)
+    elseif drag.mode == "slider" then
+        setSpeedFromX(input.Position.X)
+    end
+end))
+
+table.insert(conns, UserInputService.InputEnded:Connect(function(input)
+    if not drag or not isPointer(input) then return end
+    local mode = drag.mode
+    drag = nil
+    if mode == "move" then
+        state.posX, state.posY = main.Position.X.Offset, main.Position.Y.Offset
+    end
+    saveSettings()
+end))
+
+------------------------------------------------------------------------
+-- Minimize / UI toggle
+------------------------------------------------------------------------
+-- "UI ON / UI OFF" pill at the top middle of the screen. The minimize button
+-- hides the whole window; the pill brings it back (or hides it again).
+UIX.uiToggle = new("TextButton", {
+    Name = "UIToggle",
+    Parent = gui,
+    AnchorPoint = Vector2.new(0.5, 0),
+    BackgroundColor3 = C.panel,
+    Position = UDim2.new(0.5, 0, 0, 0),
+    Size = UDim2.fromOffset(120, 36),
+    Font = Enum.Font.GothamBold,
+    Text = "UI ON",
+    TextColor3 = C.accent,
+    TextSize = 16,
+    AutoButtonColor = true,
+    ZIndex = 10,
+}, {
+    corner(10),
+    new("UIStroke", { Color = C.accent, Transparency = 0.55, Thickness = 1.5 }),
+})
+
+local function setUiVisible(on)
+    main.Visible = on
+    UIX.uiToggle.Text = on and "UI ON" or "UI OFF"
+    UIX.uiToggle.TextColor3 = on and C.accent or C.dim
+end
+
+UIX.uiToggle.MouseButton1Click:Connect(function()
+    setUiVisible(not main.Visible)
+end)
+
+UIX.minBtn.MouseButton1Click:Connect(function()
+    setUiVisible(false)
+end)
+
+UIX.unloaded = false
+local function unload()
+    if UIX.unloaded then return end
+    UIX.unloaded = true
+    renderToken = renderToken + 1
+    for _, c in ipairs(conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    pcall(function()
+        if state.track then state.track:Stop() end
+    end)
+    pcall(restoreCollisions)
+    pcall(restoreOthers)
+    state.cframeSpeedOn = false
+    pcall(setHeadStill, false)
+    -- unloading (re-execute): put the character's original animations back
+    pcall(function()
+        local hum, char = getHumanoid()
+        local animate = char and char:FindFirstChild("Animate")
+        if hum and animate and state.snapshot and state.snapshot.char == char then
+            restoreDefaults(animate, nil)
+            restartAnimate(hum, animate)
+        elseif hum then
+            for _, t in ipairs(hum:GetPlayingAnimationTracks()) do
+                if t.Priority == Enum.AnimationPriority.Action then t:Stop() end
+            end
+        end
+    end)
+    state.activePack = nil
+    state.activeParts = {}
+    state.track = nil
+    if env.EmoteHubGui == gui then env.EmoteHubGui = nil end
+    if env.EmoteHubCleanup == unload then env.EmoteHubCleanup = nil end
+    pcall(function() gui:Destroy() end) -- make sure the old window is really gone
+end
+env.EmoteHubCleanup = unload
+gui.Destroying:Connect(unload)
+
+table.insert(conns, LocalPlayer.CharacterAdded:Connect(function()
+    state.track = nil
+    state.activeEmote = nil
+    state.activePack = nil
+    state.activeParts = {}
+    state.snapshot = nil
+    applyingPack = false
+    updateHighlights()
+end))
+
+------------------------------------------------------------------------
+-- Load data
+------------------------------------------------------------------------
+updateChips()
+do
+    local startTab = saved.tab
+    if startTab ~= "Emotes" and startTab ~= "Favorites" and startTab ~= "Packs" and startTab ~= "Binds" and startTab ~= "Settings" then
+        startTab = "Emotes"
+    end
+    setTab(startTab)
+end
+
+-- Emote and anim pack lists are saved to the workspace (EmoteHub/EmoteList.json and
+-- PackList.json) the first time they download. After that they load straight from
+-- disk (works offline) and the script only refreshes them in the background.
+function UIX.toEmoteItems(list)
+    local out, n = {}, 0
+    for _, item in pairs(list) do
+        local id = tonumber(item.id or item[1])
+        if id and id > 0 then
+            local name = item.name or item[2]
+            table.insert(out, decorate({
+                kind = "emote",
+                id = id,
+                name = tostring(name or ("Emote_" .. id)),
+            }))
+            n = n + 1
+            if n % 4000 == 0 then task.wait() end
+        end
+    end
+    return out
+end
+
+task.spawn(function()
+    setStatus("Loading emotes...", true)
+    local haveSaved = false
+
+    local saved = readJson(UIX.EMOTELIST_FILE)
+    if saved then
+        local items = UIX.toEmoteItems(saved)
+        if #items > 0 then
+            haveSaved = true
+            state.emotes = items
+            state.loadingEmotes = false
+            if gui.Parent and state.tab == "Emotes" then render() end
+            setStatus(("Loaded %d emotes from your saved copy"):format(#items))
+        end
+    end
+
+    local list = UIX.fetchList(UIX.EMOTE_URL)
+    if list then
+        local fresh = UIX.toEmoteItems(list)
+        if #fresh > 0 then
+            local changed = (not haveSaved) or #fresh ~= #state.emotes
+            if changed then
+                state.emotes = fresh
+                state.loadingEmotes = false
+                if gui.Parent and state.tab == "Emotes" then render() end
+                local packed = {}
+                for i, e in ipairs(fresh) do packed[i] = { e.id, e.name } end
+                writeJson(UIX.EMOTELIST_FILE, packed)
+            end
+            setStatus(("Loaded %d emotes"):format(#fresh))
+        end
+    end
+
+    if #state.emotes == 0 then
+        state.emotes = {
+            decorate({ kind = "emote", id = 3360686498, name = "Stadium" }),
+            decorate({ kind = "emote", id = 3360692915, name = "Tilt" }),
+            decorate({ kind = "emote", id = 3576968026, name = "Shrug" }),
+            decorate({ kind = "emote", id = 3360689775, name = "Salute" }),
+        }
+        setStatus("Offline - showing a few default emotes")
+    end
+    state.loadingEmotes = false
+    if gui.Parent and state.tab == "Emotes" and not haveSaved then render() end
+end)
+
+function UIX.toPackItems(list, seen, out)
+    local n = 0
+    for _, item in pairs(list) do
+        local id = tonumber(item.id)
+        if id and id > 0 and not seen[id] and item.bundledItems then
+            seen[id] = true
+            table.insert(out, decorate({
+                kind = "pack",
+                id = id,
+                name = tostring(item.name or ("Animation_" .. id)),
+                bundledItems = item.bundledItems,
+            }))
+            n = n + 1
+            if n % 2000 == 0 then task.wait() end
+        end
+    end
+end
+
+task.spawn(function()
+    local haveSaved = false
+
+    local saved = readJson(UIX.PACKLIST_FILE)
+    if saved then
+        local items = {}
+        UIX.toPackItems(saved, {}, items)
+        if #items > 0 then
+            haveSaved = true
+            state.packs = items
+            refreshChipLabels()
+            state.loadingPacks = false
+            if gui.Parent and state.tab == "Packs" then render() end
+        end
+    end
+
+    local packs, seen = {}, {}
+    for _, url in ipairs(UIX.PACK_URLS) do
+        local list = UIX.fetchList(url)
+        if list then UIX.toPackItems(list, seen, packs) end
+    end
+
+    if #packs > 0 and ((not haveSaved) or #packs ~= #state.packs) then
+        state.packs = packs
+        refreshChipLabels()
+        state.loadingPacks = false
+        if gui.Parent and state.tab == "Packs" then render() end
+        local out = {}
+        for i, pk in ipairs(packs) do
+            out[i] = { id = pk.id, name = pk.name, bundledItems = pk.bundledItems }
+        end
+        writeJson(UIX.PACKLIST_FILE, out)
+    end
+
+    state.loadingPacks = false
+    if gui.Parent and state.tab == "Packs" and not haveSaved then render() end
+end)
